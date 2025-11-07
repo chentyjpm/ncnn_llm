@@ -41,7 +41,7 @@ Future plans include but are not limited to:
 欢迎大家关注和参与本项目，共同推动ncnn在大语言模型领域的发展！
 
 TODO LIST:
-- [ ] PaddleOCR VL
+- [ ] MiniCPM4-0.5B
 - [ ] QWen3 0.6B
 - [ ] INT8 量化
 
