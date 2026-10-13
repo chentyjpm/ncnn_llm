@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.15)
 project(ncnn_llm LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -58,6 +58,9 @@ set(NCNN_LLM_SOURCES
     src/ncnn_embedding.cpp
     src/ncnn_llm_asr.cpp
     src/ncnn_llm_gpt.cpp
+    src/minicpm_vision_runtime.cpp
+    src/utils/minicpm_vision.cpp
+    src/utils/minicpm_resize.cpp
     src/ncnn_llm_laya.cpp
     src/ncnn_llm_ocr.cpp
     src/ncnn_text_runtime.cpp
@@ -214,3 +217,31 @@ install(TARGETS
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
+
+# MiniCPM image planning and canvas MRoPE regression tests.
+add_executable(test_minicpm_vision tests/test_minicpm_vision.cpp src/utils/minicpm_vision.cpp)
+target_include_directories(test_minicpm_vision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME test_minicpm_vision COMMAND test_minicpm_vision)
+add_executable(test_minicpm_runtime tests/test_minicpm_runtime.cpp)
+target_link_libraries(test_minicpm_runtime PRIVATE ncnn_llm)
+
+add_test(NAME test_minicpm_runtime_limits COMMAND test_minicpm_runtime --check-limits)
+
+# Lightweight prompt probe: no model weights or ncnn runtime needed.
+add_executable(minicpm_prompt_probe tests/minicpm_prompt_probe.cpp src/utils/prompt.cpp)
+target_include_directories(minicpm_prompt_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(minicpm_prompt_probe PRIVATE nlohmann_json::nlohmann_json)
+
+add_executable(test_minicpm_tokenizer_config tests/test_minicpm_tokenizer_config.cpp)
+target_include_directories(test_minicpm_tokenizer_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_minicpm_tokenizer_config PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME test_minicpm_tokenizer_config COMMAND test_minicpm_tokenizer_config "${CMAKE_CURRENT_BINARY_DIR}/tokenizer-config-fixtures")
+
+add_executable(minicpm_tokenizer_probe tests/minicpm_tokenizer_probe.cpp)
+target_link_libraries(minicpm_tokenizer_probe PRIVATE ncnn_tokenizer nlohmann_json::nlohmann_json)
+add_executable(minicpm_decoder_probe tests/minicpm_decoder_probe.cpp)
+target_link_libraries(minicpm_decoder_probe PRIVATE ncnn_llm)
+add_executable(minicpm_component_probe tests/minicpm_component_probe.cpp)
+target_link_libraries(minicpm_component_probe PRIVATE ncnn)
+add_executable(minicpm_trained_vision_probe tests/minicpm_trained_vision_probe.cpp)
+target_link_libraries(minicpm_trained_vision_probe PRIVATE ncnn_llm)

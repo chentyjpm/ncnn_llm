@@ -1,10 +1,12 @@
-﻿#include <cpu.h>
+#include <cpu.h>
+#include <limits>
 #include "utils/perf_profiler.h"
 #include "kernel/lm_head.h"
 #include "embed.h"
 #include "ncnn_llm_gpt.h"
 #include "ncnn_text_runtime.h"
 #include "utils/vision_rope.h"
+#include "utils/minicpm_tokenizer_config.h"
 
 
 static nlohmann::json parse_tool_call_payload(const std::string& payload) {
@@ -126,6 +128,15 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
             ifs >> config;
         }
         
+        const bool minicpm_fp32 = config.value("setting", json::object()).value("vision", json::object()).value("type", std::string()) == "minicpm_v4_7";
+        const auto minicpm_tokenizer_file = ncnn_llm::minicpm_tokenizer_artifact(model_path, config.at("tokenizer"), minicpm_fp32);
+        if (minicpm_fp32) {
+            if(!config.at("setting").contains("rope") || config.at("setting").at("rope").value("type",std::string())!="RoPE")
+                throw std::runtime_error("MiniCPM requires an explicit unscaled RoPE configuration");
+            fprintf(stderr, "[ncnn_llm_gpt] MiniCPM-V-4.7 experimental contract: forcing CPU FP32 for text and vision; Vulkan/BF16/FP16 disabled.\n");
+            use_vulkan = false;
+            use_bf16 = false;
+        }
         model_path_ = model_path;
         use_vulkan_ = use_vulkan;
         {
@@ -197,6 +208,16 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
             printf("[ncnn_llm_gpt] BF16 storage enabled for decoder\n");
         }
 
+
+        if (minicpm_fp32) {
+            for (auto* net : {decoder_net.get(), embed_net.get(), proj_out_net.get()}) {
+                net->opt.use_vulkan_compute = false;
+                net->opt.use_bf16_storage = false;
+                net->opt.use_fp16_storage = false;
+                net->opt.use_fp16_arithmetic = false;
+                net->opt.use_fp16_packed = false;
+            }
+        }
 
         std::string decoder_param = model_path + "/" + config["params"]["decoder_param"].get<std::string>();
         std::string decoder_bin = model_path + "/" + config["params"]["decoder_bin"].get<std::string>();
@@ -303,6 +324,8 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
             bpe->AddAdditionalSpecialToken(token);
         }
 
+        if (minicpm_fp32) bpe->LoadMiniCPMTokenizer(minicpm_tokenizer_file);
+
         auto eos_token = config["tokenizer"]["eos"].get<std::string>();
         eos = (eos_token != "") ? bpe->token_to_id().at(eos_token) : -1;
         eos_ids.clear();
@@ -359,7 +382,8 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
             rope_theta = rope_cfg["rope_theta"].get<float>();
         }
 
-        if (config["setting"].contains("functions")) {
+        // Experimental MiniCPM image/text chat does not expose native tool dispatch.
+        if (!minicpm_fp32 && config["setting"].contains("functions")) {
             auto func_cfg = config["setting"]["functions"];
             if (func_cfg["type"].get<std::string>() == "tool_call") {
                 if (func_cfg.contains("tool_call_id")) {
@@ -391,7 +415,26 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
             auto vision_cfg = config["setting"]["vision"];
             vision_type_str = vision_cfg["type"].get<std::string>();
             
-            if (vision_type_str != "close") {
+            if (vision_type_str == "minicpm_v4_7") {
+                if(attn_cnt<=0 || attn_cnt>64 || sconv_cnt<=0 || sconv_cnt>192 || sconv_cnt!=gdr_cnt)
+                    throw std::runtime_error("MiniCPM requires bounded full-attention and matched convolution/GDR cache groups");
+                auto sections=vision_cfg.at("rope").at("mrope_section").get<std::vector<int>>();
+                if(sections.size()!=3 || sections[0]<0 || sections[1]<0 || sections[2]<0 ||
+                   int64_t(sections[0])+sections[1]+sections[2]!=rope_head_dim/2 ||
+                   rope_head_dim<=0 || rope_head_dim%2 || !std::isfinite(rope_theta) || rope_theta<=0 || rope_type!=RoPE_Type::RoPE)
+                    throw std::runtime_error("MiniCPM requires valid unscaled interleaved MRoPE parameters");
+                for(const char* key:{"image","image_start","image_end","slice_start","slice_end","newline"}) {
+                    const int id=vision_cfg.at("marker_ids").at(key);
+                    if(id<0 || static_cast<size_t>(id)>=bpe->vocab_size())
+                        throw std::runtime_error("MiniCPM marker id is outside the tokenizer vocabulary");
+                }
+                minicpm_vision = std::make_shared<ncnn_llm::MiniCPMVisionRuntime>(model_path, vision_cfg, num_threads);
+                vision_type = Vision_Type::VISION_MINICPM_V4_7;
+                image_pad_id = minicpm_vision->markers.image;
+                mrope_section = vision_cfg.at("rope").at("mrope_section").get<std::vector<int>>();
+                if (mrope_section.size() != 3) throw std::runtime_error("MiniCPM requires three MRoPE sections");
+                fprintf(stderr, "  MiniCPM-V-4.7 experimental single-thumbnail vision (CPU FP32)\n");
+            } else if (vision_type_str != "close") {
                 if (vision_type_str == "vit") {
                     vision_type = Vision_Type::VISION_VIT;
                 } else if (vision_type_str == "qwen3.5_vl") {
@@ -476,7 +519,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     {
         ncnn_llm::ScopedTimer t(pperf.tokenizer_encode);
         token_ids = bpe->encode(input_text, false, false);
-        if (bos >= 0) token_ids.insert(token_ids.begin(), bos);
+        if (bos >= 0 && !minicpm_vision) token_ids.insert(token_ids.begin(), bos);
     }
 
     const int total_prompt_tokens = (int)token_ids.size();
@@ -614,23 +657,33 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     if (ncnn_mat_empty(bgr)) {
         throw std::runtime_error("image input is empty");
     }
-    if (vision_type == Vision_Type::VISION_CLOSE || !vision_embed_patch || !vision_encoder) {
+    if (vision_type == Vision_Type::VISION_CLOSE || (!minicpm_vision && (!vision_embed_patch || !vision_encoder))) {
         throw std::runtime_error("model does not support image input");
     }
 
+    if (minicpm_vision) {
+        const size_t placeholder=input_text.find("<image>");
+        if (placeholder==std::string::npos || input_text.find("<image>",placeholder+7)!=std::string::npos)
+            throw std::runtime_error("MiniCPM image input requires exactly one <image> placeholder");
+        if (ctx && ctx->image_count!=0) throw std::runtime_error("MiniCPM supports only one image per context; start a new context for another image");
+    }
     const auto t_prefill_start = std::chrono::steady_clock::now();
     std::shared_ptr<ncnn_llm_gpt_ctx> new_ctx = clone_ctx(ctx);
     ncnn_llm::PrefillPerfStats& pperf = new_ctx->prefill_perf;
     ncnn::Allocator* kv_alloc = new_ctx->kvcache_allocator ? new_ctx->kvcache_allocator.get() : nullptr;
-    const int max_seqlen_hint = new_ctx->position_id + (int)input_text.size() + 512;
+
 
     ncnn::Mat image_embeds;
     int num_patches_w = 0;
     int num_patches_h = 0;
-    int vision_ret;
+    int vision_ret = 0;
+    ncnn_llm::minicpm::Thumbnail thumbnail{};
     {
         ncnn_llm::ScopedTimer t(pperf.vision_feature_extract);
-        vision_ret = get_visiual_features(bgr, image_embeds, num_patches_w, num_patches_h);
+        if (minicpm_vision) {
+            image_embeds = minicpm_vision->encode(bgr, thumbnail);
+            num_patches_w = thumbnail.patch_cols; num_patches_h = thumbnail.patch_rows;
+        } else vision_ret = get_visiual_features(bgr, image_embeds, num_patches_w, num_patches_h);
     }
     if (vision_ret != 0 || image_embeds.empty()) {
         throw std::runtime_error("vision feature extraction failed");
@@ -640,9 +693,19 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     std::vector<int> token_ids;
     {
         ncnn_llm::ScopedTimer t(pperf.tokenizer_encode);
-        token_ids = bpe->encode(input_text, false, false);
+        if (minicpm_vision) {
+            const size_t placeholder = input_text.find("<image>");
+            if (placeholder == std::string::npos || input_text.find("<image>", placeholder + 7) != std::string::npos)
+                throw std::runtime_error("MiniCPM image input requires exactly one <image> placeholder");
+            token_ids = bpe->encode(input_text.substr(0, placeholder), false, false);
+            token_ids.push_back(minicpm_vision->markers.image_start);
+            token_ids.insert(token_ids.end(), image_embeds_size, image_pad_id);
+            token_ids.push_back(minicpm_vision->markers.image_end);
+            auto suffix = bpe->encode(input_text.substr(placeholder + 7), false, false);
+            token_ids.insert(token_ids.end(), suffix.begin(), suffix.end());
+        } else token_ids = bpe->encode(input_text, false, false);
     }
-    const int total_prompt_tokens = (int)token_ids.size();
+    int total_prompt_tokens = (int)token_ids.size();
     if (token_ids.empty()) {
         throw std::runtime_error("input text produced no tokens");
     }
@@ -657,13 +720,31 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     }
 
     int image_pad_index = -1;
-    inject_image_embeds(token_ids, token_embed, image_pad_index, image_pad_id, image_embeds);
+    if (minicpm_vision) {
+        if (token_embed.w != image_embeds.w || token_embed.h != (int)token_ids.size())
+            throw std::runtime_error("MiniCPM text/vision embedding shape mismatch");
+        image_pad_index = std::find(token_ids.begin(), token_ids.end(), image_pad_id) - token_ids.begin();
+        if (image_pad_index + image_embeds_size > token_embed.h) throw std::runtime_error("invalid image span");
+        for (int i=0; i<image_embeds_size; ++i)
+            std::memcpy(token_embed.row(image_pad_index+i), image_embeds.row(i), image_embeds.w*sizeof(float));
+    } else inject_image_embeds(token_ids, token_embed, image_pad_index, image_pad_id, image_embeds);
+    total_prompt_tokens = (int)token_ids.size();
     if (image_pad_index < 0) {
         throw std::runtime_error("image placeholder token was not found in the prompt");
     }
 
     ncnn::Mat cos_cache, sin_cache;
-    if (image_embeds.empty()) {
+    if (minicpm_vision) {
+        const auto positions = ncnn_llm::minicpm::canvas_positions(token_ids, minicpm_vision->markers,
+            num_patches_h, num_patches_w, minicpm_vision->mode, new_ctx->position_id);
+        std::vector<float> cc, ss;
+        ncnn_llm::minicpm::interleaved_rope(positions, rope_head_dim, rope_theta,
+            {mrope_section[0],mrope_section[1],mrope_section[2]}, cc, ss);
+        cos_cache = ncnn::Mat(rope_head_dim/2, total_prompt_tokens, cc.data()).clone();
+        sin_cache = ncnn::Mat(rope_head_dim/2, total_prompt_tokens, ss.data()).clone();
+        if (positions.next_position > std::numeric_limits<int>::max()) throw std::runtime_error("MiniCPM position overflow");
+        new_ctx->position_id = (int)positions.next_position;
+    } else if (image_embeds.empty()) {
         generate_rope_embed_cache(token_ids.size(), rope_head_dim, new_ctx->position_id, cos_cache, sin_cache, rope_theta);
         new_ctx->position_id += token_ids.size();
     } else {
@@ -676,6 +757,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
                                 (std::max(num_patches_w, num_patches_h) / spatial_merge_size);
     }
 
+    const int max_seqlen_hint = (int)token_ids.size() + new_ctx->kv_cache[0].first.h + 512;
     ncnn::Mat mask((int)token_ids.size() + new_ctx->kv_cache[0].first.h, (int)token_ids.size());
     mask.fill(0.0f);
     for (int i = 0; i < (int)token_ids.size(); i++) {
@@ -769,6 +851,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         }
     }
     new_ctx->cur_token = next_token_id;
+    if (minicpm_vision) new_ctx->image_count=1;
     const auto t_prefill_end = std::chrono::steady_clock::now();
     pperf.total_ms += std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
     pperf.prompt_tokens += total_prompt_tokens;
@@ -780,7 +863,9 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     std::shared_ptr<ncnn_llm_gpt_ctx> new_ctx = clone_ctx(ctx);
     ncnn_llm::PrefillPerfStats& pperf = new_ctx->prefill_perf;
     ncnn::Allocator* kv_alloc = new_ctx->kvcache_allocator ? new_ctx->kvcache_allocator.get() : nullptr;
-    const int max_seqlen_hint = new_ctx->position_id + (int)input_text.size() + 512;
+    // Canvas MRoPE positions can be shorter than the physical image-token KV cache.
+    const int cache_prefix = minicpm_vision ? new_ctx->kv_cache[0].first.h : new_ctx->position_id;
+    const int max_seqlen_hint = cache_prefix + (int)input_text.size() + 512;
 
     std::vector<int> token_ids;
     {
@@ -1037,6 +1122,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
             mask.fill(0.f);
         }
 
+        const int decode_max_seqlen_hint =
+            (minicpm_vision ? ctx->kv_cache[0].first.h + 1 : ctx->position_id) + cfg.max_new_tokens;
         ncnn::Mat decode_out;
         {
             ncnn_llm::ScopedTimer t(do_perf ? &decode_perf.decoder_step : nullptr);
@@ -1045,12 +1132,12 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
                 decode_out = llm_run_decoder_with_kv(*decoder_net, cur_embed, mask, cos_cache, sin_cache,
                                                      ctx->kv_cache, attn_cnt, false,
                                                      ctx->kvcache_allocator ? ctx->kvcache_allocator.get() : nullptr,
-                                                     ctx->position_id + cfg.max_new_tokens);
+                                                     decode_max_seqlen_hint);
             } else {
                 ncnn::Extractor ex = decoder_net->create_extractor();
                 if (ctx->kvcache_allocator) {
                     ex.set_kvcache_allocator(ctx->kvcache_allocator.get());
-                    ex.set_kvcache_max_seqlen_hint(ctx->position_id + cfg.max_new_tokens);
+                    ex.set_kvcache_max_seqlen_hint(decode_max_seqlen_hint);
                 }
                 ex.input("in0", cur_embed);
                 ex.input("in1", mask);

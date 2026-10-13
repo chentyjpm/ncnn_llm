@@ -1,4 +1,7 @@
-﻿#pragma once
+#pragma once
+
+// Versioned build capability for downstream adapters; absent in older runtimes.
+#define NCNN_LLM_MINICPM_V47_RUNTIME 1
 
 #include <array>
 #include <cassert>
@@ -28,6 +31,7 @@
 #include "utils/image_utils.h"
 #include "utils/perf_profiler.h"
 #include "kernel/lm_head.h"
+#include "minicpm_vision_runtime.h"
 
 using nlohmann::json;
 
@@ -73,6 +77,7 @@ public:
     KVCache kv_cache;
     int cur_token = 0;
     int position_id = 0;
+    int image_count = 0;
     ncnn_llm::PrefillPerfStats prefill_perf;
 };
 
@@ -89,6 +94,7 @@ public:
         }
         dst->cur_token = cur_token;
         dst->position_id = position_id;
+        dst->image_count = image_count;
         dst->prefill_perf = prefill_perf;
         return dst;
     }
@@ -124,6 +130,7 @@ public:
         }
         dst->cur_token = cur_token;
         dst->position_id = position_id;
+        dst->image_count = image_count;
         dst->prefill_perf = prefill_perf;
         return dst;
     }
@@ -139,6 +146,7 @@ private:
     std::shared_ptr<ncnn::Net> vision_embed_pos;
     std::shared_ptr<ncnn::Net> vision_encoder;
     std::shared_ptr<BpeTokenizer> bpe;
+    std::shared_ptr<ncnn_llm::MiniCPMVisionRuntime> minicpm_vision;
 
 protected:
     std::string model_type;
@@ -177,7 +185,8 @@ protected:
     enum Vision_Type {
         VISION_CLOSE = 0,
         VISION_VIT = 1,
-        VISION_QWEN3_5_VL = 2
+        VISION_QWEN3_5_VL = 2,
+        VISION_MINICPM_V4_7 = 3
     } vision_type;
 
     enum VisionRoPE_Type {
@@ -198,6 +207,7 @@ public:
 
     std::shared_ptr<ncnn_llm_gpt_ctx> define_tools(const std::shared_ptr<ncnn_llm_gpt_ctx>& ctx, const std::vector<nlohmann::json>& tools, const std::string& system_prompt = "You are a helpful assistant.", TemplateType template_type = TemplateType::CHATML);
 
+    std::string image_prompt_placeholder() const { return minicpm_vision ? "<image>\n" : "<|vision_start|><|image_pad|><|vision_end|>"; }
     bool supports_tool_calling() const { return tool_call_id >= 0; }
     bool supports_vision() const { return vision_type != Vision_Type::VISION_CLOSE; }
     const std::string& get_model_type() const { return model_type; }
