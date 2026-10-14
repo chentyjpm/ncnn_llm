@@ -1,3 +1,5 @@
+#include <set>
+#include <filesystem>
 #include <cpu.h>
 #include <limits>
 #include "utils/perf_profiler.h"
@@ -8,6 +10,21 @@
 #include "utils/vision_rope.h"
 #include "utils/minicpm_tokenizer_config.h"
 
+
+// Shared loading and diagnostics for language, legacy vision and MiniCPM graphs.
+static void load_net(ncnn::Net& net, const std::string& name,
+                     const std::string& param_path, const std::string& bin_path) {
+    const int param_ret = net.load_param(param_path.c_str());
+    if (param_ret != 0) {
+        throw std::runtime_error(name + " load_param failed (ret=" +
+                                 std::to_string(param_ret) + "): " + param_path);
+    }
+    const int model_ret = net.load_model(bin_path.c_str());
+    if (model_ret != 0) {
+        throw std::runtime_error(name + " load_model failed (ret=" +
+                                 std::to_string(model_ret) + "): " + bin_path);
+    }
+}
 
 static nlohmann::json parse_tool_call_payload(const std::string& payload) {
     try {
@@ -234,19 +251,7 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
         printf("  proj_out param: %s\n", proj_out_param.c_str());
         printf("  proj_out bin: %s\n", proj_out_bin.c_str());
 
-        auto load_net = [](ncnn::Net& net, const std::string& name,
-                           const std::string& param_path, const std::string& bin_path) {
-            const int param_ret = net.load_param(param_path.c_str());
-            if (param_ret != 0) {
-                throw std::runtime_error(name + " load_param failed (ret=" +
-                                         std::to_string(param_ret) + "): " + param_path);
-            }
-            const int model_ret = net.load_model(bin_path.c_str());
-            if (model_ret != 0) {
-                throw std::runtime_error(name + " load_model failed (ret=" +
-                                         std::to_string(model_ret) + "): " + bin_path);
-            }
-        };
+
 
         register_gdr_layers(*decoder_net, force_naive);
 
@@ -428,7 +433,7 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int n
                     if(id<0 || static_cast<size_t>(id)>=bpe->vocab_size())
                         throw std::runtime_error("MiniCPM marker id is outside the tokenizer vocabulary");
                 }
-                minicpm_vision = std::make_shared<ncnn_llm::MiniCPMVisionRuntime>(model_path, vision_cfg, num_threads);
+                minicpm_vision = load_minicpm_vision(model_path, vision_cfg, num_threads);
                 vision_type = Vision_Type::VISION_MINICPM_V4_7;
                 image_pad_id = minicpm_vision->markers.image;
                 mrope_section = vision_cfg.at("rope").at("mrope_section").get<std::vector<int>>();
@@ -677,13 +682,9 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     int num_patches_w = 0;
     int num_patches_h = 0;
     int vision_ret = 0;
-    ncnn_llm::minicpm::Thumbnail thumbnail{};
     {
         ncnn_llm::ScopedTimer t(pperf.vision_feature_extract);
-        if (minicpm_vision) {
-            image_embeds = minicpm_vision->encode(bgr, thumbnail);
-            num_patches_w = thumbnail.patch_cols; num_patches_h = thumbnail.patch_rows;
-        } else vision_ret = get_visiual_features(bgr, image_embeds, num_patches_w, num_patches_h);
+        vision_ret = get_visiual_features(bgr, image_embeds, num_patches_w, num_patches_h);
     }
     if (vision_ret != 0 || image_embeds.empty()) {
         throw std::runtime_error("vision feature extraction failed");
@@ -720,14 +721,8 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     }
 
     int image_pad_index = -1;
-    if (minicpm_vision) {
-        if (token_embed.w != image_embeds.w || token_embed.h != (int)token_ids.size())
-            throw std::runtime_error("MiniCPM text/vision embedding shape mismatch");
-        image_pad_index = std::find(token_ids.begin(), token_ids.end(), image_pad_id) - token_ids.begin();
-        if (image_pad_index + image_embeds_size > token_embed.h) throw std::runtime_error("invalid image span");
-        for (int i=0; i<image_embeds_size; ++i)
-            std::memcpy(token_embed.row(image_pad_index+i), image_embeds.row(i), image_embeds.w*sizeof(float));
-    } else inject_image_embeds(token_ids, token_embed, image_pad_index, image_pad_id, image_embeds);
+    inject_image_embeds(token_ids, token_embed, image_pad_index, image_pad_id,
+                        image_embeds, static_cast<bool>(minicpm_vision));
     total_prompt_tokens = (int)token_ids.size();
     if (image_pad_index < 0) {
         throw std::runtime_error("image placeholder token was not found in the prompt");
@@ -1432,6 +1427,14 @@ int ncnn_llm_gpt::get_visiual_features(const ncnn::Mat& bgr, ncnn::Mat& image_em
         return 0;
     }
 
+    if (minicpm_vision) {
+        ncnn_llm::minicpm::Thumbnail thumbnail{};
+        image_embeds = encode_minicpm_vision(*minicpm_vision, bgr, thumbnail);
+        num_patches_w = thumbnail.patch_cols;
+        num_patches_h = thumbnail.patch_rows;
+        return 0;
+    }
+
     int img_w = bgr.w;
     int img_h = bgr.h;
 
@@ -1586,4 +1589,162 @@ void ncnn_llm_gpt::print_last_perf_report(bool include_layer_stats) const {
 
 std::string ncnn_llm_gpt::get_last_perf_report_str(bool include_layer_stats) const {
     return last_perf_report.to_string(include_layer_stats);
+}
+
+
+// MiniCPM-specific graph stages within the shared GPT vision pipeline.
+namespace {
+void require_minicpm(bool ok, const std::string& why) { if (!ok) throw std::runtime_error("MiniCPM vision: " + why); }
+std::string minicpm_model_file(const std::string& root, const std::string& name, uintmax_t limit) {
+    const std::filesystem::path relative(name);
+    require_minicpm(!name.empty() && name.find('\\')==std::string::npos && name.find(':')==std::string::npos &&
+            !relative.is_absolute() && !relative.has_root_path(), "manifest resource must be a relative model file");
+    auto path=std::filesystem::canonical(root);
+    for(const auto& part:relative) {
+        require_minicpm(part!=".." && part!=".", "manifest resource traversal is unsupported");
+        path/=part;
+        require_minicpm(!std::filesystem::is_symlink(path), "manifest resource symlinks are unsupported");
+    }
+    require_minicpm(std::filesystem::is_regular_file(path), "missing model resource: "+name);
+    require_minicpm(std::filesystem::file_size(path)<=limit, "model resource exceeds size limit: "+name);
+    return path.string();
+}
+void require_minicpm_matrix(const ncnn::Mat& m, int rows, int cols, const std::string& name) {
+    require_minicpm(m.dims == 2 && m.w == cols && m.h == rows && m.elempack == 1 && m.elemsize == 4u, name + " shape/precision mismatch");
+}
+// Row-major 2x2 windows, each flattened in [dy,dx,channel] order.
+ncnn::Mat pack_minicpm_windows(const ncnn::Mat& in, int h, int w) {
+    require_minicpm(h%2==0 && w%2==0, "odd merge grid");
+    ncnn::Mat out(in.w*4,h*w/4);
+    require_minicpm(!out.empty(), "window packing allocation failed");
+    for(int y=0;y<h/2;++y) for(int x=0;x<w/2;++x) {
+        float* dst=out.row(y*(w/2)+x);
+        for(int dy=0;dy<2;++dy) for(int dx=0;dx<2;++dx)
+            std::memcpy(dst+(dy*2+dx)*in.w,in.row((y*2+dy)*w+x*2+dx),in.w*sizeof(float));
+    }
+    return out;
+}
+}
+std::shared_ptr<ncnn_llm::MiniCPMVisionState> ncnn_llm_gpt::load_minicpm_vision(
+    const std::string& dir, const nlohmann::json& cfg, int threads) {
+    auto state = std::shared_ptr<ncnn_llm::MiniCPMVisionState>(new ncnn_llm::MiniCPMVisionState);
+    auto& mode = state->mode;
+    auto& hidden = state->hidden;
+    auto& output_hidden = state->output_hidden;
+    auto& patch = state->patch;
+    auto& position_side = state->position_side;
+    auto& scale = state->scale;
+    auto& slice_mode = state->slice_mode;
+    auto& max_slices = state->max_slices;
+    auto& markers = state->markers;
+    auto& graphs = state->graphs;
+    auto& position = state->position;
+    std::ifstream file(minicpm_model_file(dir,cfg.at("manifest").get<std::string>(),1024*1024));
+    require_minicpm(file.good(), "missing manifest");
+    nlohmann::json manifest; file>>manifest;
+    validate_minicpm_vision_manifest(manifest);
+    mode=manifest.at("downsample_mode").get<std::string>();
+    require_minicpm(mode=="16x", "only 16x component graphs are supported");
+    hidden=manifest.at("hidden_size"); output_hidden=manifest.at("output_hidden_size");
+    patch=manifest.at("patch_size"); position_side=manifest.at("position_grid_size");
+    std::fprintf(stderr, "[MiniCPM vision] Preprocessing: official MiniCPMV4_6ImageProcessorPil-compatible, Pillow 12.3 bicubic; default Torchvision resize is a different backend.\n");
+    scale=cfg.value("scale_resolution",448); slice_mode=cfg.value("slice_mode",true); max_slices=cfg.value("max_slice_nums",9);
+    require_minicpm(scale>0 && scale<=896 && max_slices>=1 && max_slices<=9, "unsupported thumbnail scale or slice limit");
+    auto ids=cfg.at("marker_ids");
+    markers={ids.at("image"),ids.at("image_start"),ids.at("image_end"),ids.at("slice_start"),ids.at("slice_end"),ids.at("newline")};
+    std::set<int> unique_ids;
+    for(int id:{markers.image,markers.image_start,markers.image_end,markers.slice_start,markers.slice_end,markers.newline}) {
+        require_minicpm(id>=0, "negative marker token id"); unique_ids.insert(id);
+    }
+    require_minicpm(unique_ids.size()==6, "marker token ids must be distinct");
+    for(const char* name:{"patch_embed","encoder_pre","window_attn","window_mlp","encoder_post","projector"}) {
+        auto net=std::make_shared<ncnn::Net>();
+        net->opt.use_vulkan_compute=false; net->opt.use_packing_layout=false;
+        net->opt.use_fp16_packed=false; net->opt.use_fp16_storage=false; net->opt.use_fp16_arithmetic=false; net->opt.use_bf16_storage=false;
+        if(threads>0) net->opt.num_threads=threads;
+        const auto& component=manifest.at("components").at(name);
+        load_net(*net, std::string("MiniCPM vision/")+name,
+            minicpm_model_file(dir,component.at("param").get<std::string>(),16*1024*1024),
+            minicpm_model_file(dir,component.at("bin").get<std::string>(),uintmax_t(8)*1024*1024*1024));
+        graphs[name]=net;
+    }
+    auto pos=manifest.at("position_embeddings");
+    require_minicpm(pos.at("rows").get<int>()==position_side*position_side && pos.at("cols").get<int>()==hidden,"position table shape mismatch");
+    position.resize(static_cast<size_t>(position_side)*position_side*hidden);
+    std::ifstream weights(minicpm_model_file(dir,pos.at("file").get<std::string>(),position.size()*sizeof(float)),std::ios::binary);
+    require_minicpm(weights.good() && bool(weights.read(reinterpret_cast<char*>(position.data()),position.size()*sizeof(float))),"truncated position table");
+    require_minicpm(weights.peek()==std::char_traits<char>::eof(),"oversized position table");
+    return state;
+}
+static ncnn::Mat run_minicpm_graph(const std::map<std::string, std::shared_ptr<ncnn::Net>>& graphs,
+                                    const std::string& name, const ncnn::Mat& input) {
+    auto ex=graphs.at(name)->create_extractor(); ncnn::Mat out;
+    require_minicpm(ex.input("in0",input)==0,"input failed: "+name);
+    require_minicpm(ex.extract("out0",out)==0 && !out.empty(),"extraction failed: "+name);
+    return out;
+}
+void ncnn_llm_gpt::validate_minicpm_vision_manifest(const nlohmann::json& m) {
+    require_minicpm(m.at("type")=="minicpm_v47" && m.at("format_version")==1 && m.at("weight_dtype")=="float32" &&
+            m.at("scope")=="single_image_thumbnail" && m.at("downsample_mode")=="16x", "unsupported manifest format/precision/scope");
+    const int h=m.at("hidden_size"), out=m.at("output_hidden_size"), side=m.at("position_grid_size");
+    require_minicpm(h>0 && h<=2048 && out>0 && out<=8192 && side>0 && side<=128 && m.at("patch_size")==14,
+            "unsupported or excessive architecture dimensions");
+    require_minicpm(m.at("window_kernel_size")==nlohmann::json::array({2,2}) &&
+            m.at("merge_kernel_size")==nlohmann::json::array({2,2}), "only 2x2 window and projector merges are supported");
+    const int layers=m.at("num_hidden_layers"), insertion=m.at("insert_layer_id");
+    require_minicpm(layers>1 && layers<=64 && insertion>=0 && insertion<layers-1, "invalid encoder partition");
+    require_minicpm(m.at("position_embeddings").at("rows").get<int>()==side*side &&
+            m.at("position_embeddings").at("cols").get<int>()==h, "position table shape mismatch");
+}
+void ncnn_llm_gpt::validate_minicpm_thumbnail(const ncnn_llm::minicpm::Thumbnail& t) {
+    require_minicpm(t.patch_rows>0 && t.patch_cols>0 && static_cast<int64_t>(t.patch_rows)*t.patch_cols <= 4096,
+            "experimental thumbnail exceeds 4096 ViT patches or has invalid dimensions; extreme aspect ratios are unsupported");
+}
+ncnn::Mat ncnn_llm_gpt::encode_minicpm_vision(const ncnn_llm::MiniCPMVisionState& state,
+    const ncnn::Mat& bgr, ncnn_llm::minicpm::Thumbnail& t) {
+    const auto& mode = state.mode;
+    const auto& hidden = state.hidden;
+    const auto& output_hidden = state.output_hidden;
+    const auto& patch = state.patch;
+    const auto& position_side = state.position_side;
+    const auto& scale = state.scale;
+    const auto& slice_mode = state.slice_mode;
+    const auto& max_slices = state.max_slices;
+    const auto& position = state.position;
+    require_minicpm(!bgr.empty() && bgr.dims==3 && bgr.c==3 && bgr.elemsize==1u && bgr.elempack==1,"expected interleaved BGR uint8 image");
+    require_minicpm(bgr.w>0 && bgr.h>0 && bgr.w<=16384 && bgr.h<=16384 && static_cast<int64_t>(bgr.w)*bgr.h<=16000000, "input image exceeds the experimental dimension limit");
+    t=ncnn_llm::minicpm::plan_thumbnail(bgr.h,bgr.w,patch,scale,mode,slice_mode,max_slices);
+    validate_minicpm_thumbnail(t);
+    const unsigned char* raw=static_cast<const unsigned char*>(bgr.data);
+    std::vector<uint8_t> source(raw,raw+static_cast<size_t>(bgr.w)*bgr.h*3);
+    const auto rgb=ncnn_llm::minicpm::resize_bicubic_rgb(source,bgr.h,bgr.w,t.height,t.width,true);
+    ncnn::Mat pixels(t.width,t.height,3);
+    require_minicpm(!pixels.empty(), "pixel allocation failed");
+    for(int c=0;c<3;++c) {
+        float* values=pixels.channel(c);
+        for(size_t i=0;i<static_cast<size_t>(t.width)*t.height;++i)
+            values[i]=(static_cast<float>(rgb[i*3+c])/255.f-0.5f)/0.5f;
+    }
+    ncnn::Mat x=run_minicpm_graph(state.graphs, "patch_embed",pixels);
+    require_minicpm_matrix(x,t.patch_rows*t.patch_cols,hidden,"patch_embed");
+    auto positions=ncnn_llm::minicpm::nearest_position_ids(t.patch_rows,t.patch_cols,position_side);
+    for(int i=0;i<x.h;++i) { float* row=x.row(i); const float* p=position.data()+positions[i]*hidden; for(int c=0;c<hidden;++c) row[c]+=p[c]; }
+    x=run_minicpm_graph(state.graphs, "encoder_pre",x); require_minicpm_matrix(x,t.patch_rows*t.patch_cols,hidden,"encoder_pre");
+    ncnn::Mat windows=pack_minicpm_windows(x,t.patch_rows,t.patch_cols);
+    ncnn::Mat attended(hidden*4,windows.h);
+    require_minicpm(!attended.empty(), "window attention allocation failed");
+    for(int i=0;i<windows.h;++i) {
+        // A row view has no refcount. ncnn's light-mode in-place dispatcher
+        // needs an owned input before the attention branch's LayerNorm.
+        ncnn::Mat one=ncnn::Mat(hidden,4,static_cast<void*>(windows.row(i))).clone();
+        require_minicpm(!one.empty(), "window input allocation failed");
+        ncnn::Mat result=run_minicpm_graph(state.graphs, "window_attn",one); require_minicpm_matrix(result,4,hidden,"window_attn");
+        std::memcpy(attended.row(i),result.data,4*hidden*sizeof(float));
+    }
+    x=run_minicpm_graph(state.graphs, "window_mlp",attended); require_minicpm_matrix(x,windows.h,hidden,"window_mlp");
+    for(int i=0;i<x.h;++i) { float* row=x.row(i); const float* a=attended.row(i); for(int c=0;c<hidden;++c) row[c]+=(a[c]+a[hidden+c]+a[2*hidden+c]+a[3*hidden+c])*0.25f; }
+    x=run_minicpm_graph(state.graphs, "encoder_post",x); require_minicpm_matrix(x,windows.h,hidden,"encoder_post");
+    x=run_minicpm_graph(state.graphs, "projector",pack_minicpm_windows(x,t.patch_rows/2,t.patch_cols/2));
+    require_minicpm_matrix(x,t.token_count(),output_hidden,"projector");
+    return x;
 }

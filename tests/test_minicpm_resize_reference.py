@@ -1,6 +1,7 @@
 """Byte-exact comparison of C++ thumbnail bicubic resize against Pillow.
-No model weights, Torch, or ncnn runtime needed.
+No model weights or Torch needed. Uses the CMake-built image utility probe.
 """
+from minicpm_test_build import probe_path
 import ctypes
 import pathlib
 import subprocess
@@ -20,9 +21,7 @@ def main():
     dimensions += [tuple(int(x) for x in rng.integers(1,200,size=4)) for _ in range(200)]
     with tempfile.TemporaryDirectory() as td:
         so=pathlib.Path(td)/'probe.so'
-        subprocess.run(['g++','-std=c++11','-O2','-Wall','-Wextra','-Werror','-pedantic',
-                        '-shared','-fPIC','-I'+str(root/'src'),str(root/'tests/minicpm_resize_probe.cpp'),
-                        str(root/'src/utils/minicpm_resize.cpp'),'-o',str(so)],check=True)
+        so = probe_path('minicpm_resize_probe', 'library')
         lib=ctypes.CDLL(str(so))
         pointer=ctypes.POINTER(ctypes.c_ubyte)
         run=lib.minicpm_resize_probe

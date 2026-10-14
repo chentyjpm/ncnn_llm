@@ -1,5 +1,5 @@
 // Real-checkpoint vision-only parity probe; never allocates the language model.
-#include "minicpm_vision_runtime.h"
+#include "ncnn_llm_gpt.h"
 #include "utils/image_utils.h"
 #include <fstream>
 #include <iostream>
@@ -39,11 +39,11 @@ int main(int argc, char** argv) {
         ncnn::Mat image = load_image_to_ncnn_mat(argv[2]);
         if (image.empty()) throw std::runtime_error("Cannot decode image");
         std::cerr << "vision_load_start\n";
-        ncnn_llm::MiniCPMVisionRuntime vision(directory, config.at("setting").at("vision"), threads);
+        auto vision = ncnn_llm_gpt::load_minicpm_vision(directory, config.at("setting").at("vision"), threads);
         std::cerr << "vision_load_complete\n";
         ncnn_llm::minicpm::Thumbnail thumbnail{};
         std::cerr << "vision_encode_start\n";
-        const ncnn::Mat output = vision.encode(image, thumbnail);
+        const ncnn::Mat output = ncnn_llm_gpt::encode_minicpm_vision(*vision, image, thumbnail);
         std::cerr << "vision_encode_complete\n";
         std::ofstream file(argv[3], std::ios::binary);
         for (int row = 0; row < output.h; ++row)

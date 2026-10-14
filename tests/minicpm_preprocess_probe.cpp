@@ -1,5 +1,5 @@
-#include "utils/minicpm_resize.h"
-#include "utils/minicpm_vision.h"
+#include "utils/image_utils.h"
+#include "utils/rope_embed.h"
 #include <algorithm>
 #include <exception>
 extern "C" int minicpm_preprocess_probe(const unsigned char* src,int h,int w,int patch,int scale,float* dst,int capacity,int* shape) {

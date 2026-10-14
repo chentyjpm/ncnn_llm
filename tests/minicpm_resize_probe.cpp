@@ -1,4 +1,4 @@
-#include "utils/minicpm_resize.h"
+#include "utils/image_utils.h"
 #include <algorithm>
 #include <exception>
 extern "C" int minicpm_resize_probe(const unsigned char* src,int h,int w,int th,int tw,int bgr,unsigned char* dst) {

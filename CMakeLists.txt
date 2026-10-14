@@ -58,9 +58,6 @@ set(NCNN_LLM_SOURCES
     src/ncnn_embedding.cpp
     src/ncnn_llm_asr.cpp
     src/ncnn_llm_gpt.cpp
-    src/minicpm_vision_runtime.cpp
-    src/utils/minicpm_vision.cpp
-    src/utils/minicpm_resize.cpp
     src/ncnn_llm_laya.cpp
     src/ncnn_llm_ocr.cpp
     src/ncnn_text_runtime.cpp
@@ -219,8 +216,8 @@ install(TARGETS
 )
 
 # MiniCPM image planning and canvas MRoPE regression tests.
-add_executable(test_minicpm_vision tests/test_minicpm_vision.cpp src/utils/minicpm_vision.cpp)
-target_include_directories(test_minicpm_vision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(test_minicpm_vision tests/test_minicpm_vision.cpp)
+target_link_libraries(test_minicpm_vision PRIVATE ncnn_llm)
 add_test(NAME test_minicpm_vision COMMAND test_minicpm_vision)
 add_executable(test_minicpm_runtime tests/test_minicpm_runtime.cpp)
 target_link_libraries(test_minicpm_runtime PRIVATE ncnn_llm)
@@ -245,3 +242,16 @@ add_executable(minicpm_component_probe tests/minicpm_component_probe.cpp)
 target_link_libraries(minicpm_component_probe PRIVATE ncnn)
 add_executable(minicpm_trained_vision_probe tests/minicpm_trained_vision_probe.cpp)
 target_link_libraries(minicpm_trained_vision_probe PRIVATE ncnn_llm)
+
+# Reference probes exercise the same existing utility objects used by runtime.
+add_executable(minicpm_vision_reference_probe tests/minicpm_vision_reference_probe.cpp)
+target_link_libraries(minicpm_vision_reference_probe PRIVATE ncnn_llm)
+foreach(probe minicpm_resize_probe minicpm_preprocess_probe)
+    add_library(${probe} SHARED tests/${probe}.cpp src/utils/image_utils.cpp)
+    set_target_properties(${probe} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    target_include_directories(${probe} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(${probe} PRIVATE ncnn)
+endforeach()
+add_executable(test_vision_utils tests/test_vision_utils.cpp)
+target_link_libraries(test_vision_utils PRIVATE ncnn_llm)
+add_test(NAME test_vision_utils COMMAND test_vision_utils)

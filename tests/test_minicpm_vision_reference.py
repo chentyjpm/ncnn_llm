@@ -4,6 +4,7 @@ No checkpoint tensors or language/vision modules are allocated. Uses the real
 MiniCPMV4_7Model positioning methods and Qwen3_5TextRotaryEmbedding from installed
 Transformers; config is read from the requested checkpoint directory.
 """
+from minicpm_test_build import probe_path
 import argparse
 import pathlib
 import subprocess
@@ -52,9 +53,7 @@ def main():
         records.append(' '.join(map(str,fields)))
     with tempfile.TemporaryDirectory() as td:
         probe = pathlib.Path(td)/'probe'
-        subprocess.run(['g++','-std=c++11','-O2','-Wall','-Wextra','-I'+str(root/'src'),
-                        str(root/'tests/minicpm_vision_reference_probe.cpp'),
-                        str(root/'src/utils/minicpm_vision.cpp'),'-o',str(probe)],check=True)
+        probe = probe_path('minicpm_vision_reference_probe', 'executable')
         result = subprocess.run([str(probe)],input='\n'.join(records)+'\n',capture_output=True,text=True,check=True)
     lines = result.stdout.splitlines()
     assert len(lines) == 5*len(cases)

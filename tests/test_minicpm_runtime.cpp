@@ -1,6 +1,5 @@
 // Real-checkpoint smoke/parity runner. Not registered with CTest: weights are optional.
 #include "ncnn_llm_gpt.h"
-#include "minicpm_vision_runtime.h"
 #include "utils/prompt.h"
 #include "utils/minicpm_tokenizer_config.h"
 #include <iostream>
@@ -9,29 +8,28 @@
 int main(int argc,char** argv) {
     try {
         if(argc==2 && std::string(argv[1])=="--check-limits") {
-            using ncnn_llm::MiniCPMVisionRuntime;
-            MiniCPMVisionRuntime::validate_thumbnail({896,896,64,64,16,16});
+            ncnn_llm_gpt::validate_minicpm_thumbnail({896,896,64,64,16,16});
             for(auto shape : std::vector<std::pair<int,int>>{{1,4097},{0,64},{-1,64},{2147483647,2147483647}}) {
                 bool rejected=false;
-                try { MiniCPMVisionRuntime::validate_thumbnail({0,0,shape.first,shape.second,0,0}); }
+                try { ncnn_llm_gpt::validate_minicpm_thumbnail({0,0,shape.first,shape.second,0,0}); }
                 catch(const std::runtime_error&) { rejected=true; }
                 if(!rejected) throw std::runtime_error("thumbnail limit boundary was accepted");
             }
             const auto extreme=ncnn_llm::minicpm::plan_thumbnail(1,16384,14,448,"16x",false,1);
             bool rejected=false;
-            try { MiniCPMVisionRuntime::validate_thumbnail(extreme); }
+            try { ncnn_llm_gpt::validate_minicpm_thumbnail(extreme); }
             catch(const std::runtime_error&) { rejected=true; }
             if(!rejected) throw std::runtime_error("extreme-aspect thumbnail was accepted");
             nlohmann::json manifest={{"type","minicpm_v47"},{"format_version",1},{"weight_dtype","float32"},
                 {"scope","single_image_thumbnail"},{"downsample_mode","16x"},{"hidden_size",1152},{"output_hidden_size",1024},
                 {"position_grid_size",70},{"patch_size",14},{"window_kernel_size",{2,2}},{"merge_kernel_size",{2,2}},
                 {"num_hidden_layers",27},{"insert_layer_id",6},{"position_embeddings",{{"rows",4900},{"cols",1152}}}};
-            MiniCPMVisionRuntime::validate_manifest(manifest);
+            ncnn_llm_gpt::validate_minicpm_vision_manifest(manifest);
             for(auto bad : std::vector<nlohmann::json>{{{"format_version",2}},{{"weight_dtype","bfloat16"}},
                     {{"hidden_size",2147483647}},{{"position_grid_size",2147483647}},{{"window_kernel_size",{2,3}}},
                     {{"insert_layer_id",27}},{{"num_hidden_layers",0}},{{"position_embeddings",{{"rows",4899},{"cols",1152}}}}}) {
                 auto changed=manifest; changed.update(bad); bool rejected=false;
-                try { MiniCPMVisionRuntime::validate_manifest(changed); }
+                try { ncnn_llm_gpt::validate_minicpm_vision_manifest(changed); }
                 catch(const std::exception&) { rejected=true; }
                 if(!rejected) throw std::runtime_error("invalid manifest boundary was accepted");
             }
@@ -64,8 +62,8 @@ int main(int argc,char** argv) {
         if(ncnn_mat_empty(image)) throw std::runtime_error("cannot load image");
         std::ifstream file(dir+"/model.json"); nlohmann::json config; file>>config;
         if(argc>5) {
-            ncnn_llm::MiniCPMVisionRuntime vision(dir,config.at("setting").at("vision"),4);
-            ncnn_llm::minicpm::Thumbnail thumb{}; auto features=vision.encode(image,thumb);
+            auto vision = ncnn_llm_gpt::load_minicpm_vision(dir,config.at("setting").at("vision"),4);
+            ncnn_llm::minicpm::Thumbnail thumb{}; auto features=ncnn_llm_gpt::encode_minicpm_vision(*vision, image,thumb);
             std::ofstream dump(argv[5],std::ios::binary);
             for(int r=0;r<features.h;++r) dump.write(reinterpret_cast<const char*>(features.row(r)),features.w*sizeof(float));
             if(!dump) throw std::runtime_error("cannot write vision dump");

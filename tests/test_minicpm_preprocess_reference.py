@@ -1,4 +1,5 @@
 """Measure complete C++ preprocessing against actual HF Torchvision/PIL backends."""
+from minicpm_test_build import probe_path
 import argparse
 import ctypes
 import io
@@ -42,9 +43,7 @@ def main():
     results=[]
     with tempfile.TemporaryDirectory() as td:
         so=pathlib.Path(td)/'probe.so'
-        subprocess.run(['g++','-std=c++11','-O2','-shared','-fPIC','-I'+str(root/'src'),
-                        str(root/'tests/minicpm_preprocess_probe.cpp'),str(root/'src/utils/minicpm_resize.cpp'),
-                        str(root/'src/utils/minicpm_vision.cpp'),'-o',str(so)],check=True)
+        so = probe_path('minicpm_preprocess_probe', 'library')
         run=ctypes.CDLL(str(so)).minicpm_preprocess_probe
         up=ctypes.POINTER(ctypes.c_ubyte); fp=ctypes.POINTER(ctypes.c_float); ip=ctypes.POINTER(ctypes.c_int)
         run.argtypes=[up,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,fp,ctypes.c_int,ip]

@@ -125,3 +125,82 @@ states match within the predeclared 5e-4 absolute/relative tolerance. Synthetic
 cached prefill/decode lengths 8/9/12 match within 4.77e-7. A full-width-RoPE exporter
 edge case was fixed by omitting the mathematically empty tail, without changing
 the trained MiniCPM partial-RoPE path.
+
+## Shared vision integration regression
+
+MiniCPM image prefill now goes through the existing
+`ncnn_llm_gpt::get_visiual_features` entry point. Model loading shares `load_net`
+with the existing text/vision graphs, and both image prompt formats share
+`inject_image_embeds`. The original five-argument injection interface remains;
+the new overload accepts a pre-expanded visual-token span. Integer placeholder
+IDs use `std::fill_n`, correcting the previous byte-wise `memset` behavior.
+
+The model-specific window-attention/projector stages are functions in
+`ncnn_llm_gpt.cpp`; their immutable, factory-created state is not an independent
+runtime. The manifest, converted graph files, CPU FP32 requirements and
+single-thumbnail restrictions are unchanged. No model reconversion is required.
+
+Preprocessing helpers now live in `utils/image_utils.{h,cpp}`, alongside the
+existing image decoder and resize functions. MiniCPM needs a separate function
+there for antialiased Pillow fixed-point bicubic resizing: neither the existing
+bilinear resize nor ncnn's float bicubic has the same rounding/filter semantics.
+The original resize functions and the existing ViT/Qwen preprocessing remain
+unchanged. Likewise, MiniCPM canvas positions and interleaved MRoPE live in
+`utils/rope_embed.{h,cpp}`; substituting the old Qwen image-position formula would
+change the canvas markers and cached decode offset. Existing Qwen/ViT RoPE
+functions retain their previous formulas.
+
+The independent `minicpm_vision_runtime`, `minicpm_vision`, and `minicpm_resize`
+source/header pairs are removed. Reference probes now link the same utility
+implementation built by CMake, rather than compiling the removed standalone
+sources. No model tensors are needed for the following checks:
+
+```sh
+"$CMAKE" --build "$BUILD" --target test_vision_utils test_minicpm_vision \
+  minicpm_resize_probe minicpm_preprocess_probe minicpm_vision_reference_probe -j2
+ctest --test-dir "$BUILD" --output-on-failure
+export NCNN_LLM_BUILD_DIR="$BUILD"
+python tests/test_minicpm_resize_reference.py
+python tests/test_minicpm_preprocess_reference.py --model-dir "$HF_MODEL"
+python tests/test_minicpm_vision_reference.py --model-dir "$HF_MODEL"
+```
+
+`test_vision_utils` covers both legacy single-placeholder expansion and the
+already-expanded span (including at the end of the prompt), prefix/suffix
+preservation, invalid-span rejection, legacy resize behavior and legacy ViT
+2-D RoPE ordering. MiniCPM helper checks remain enabled in Release builds.
+Existing legacy model integration cases can skip when their optional model
+packages are absent; passing CTest is not a claim of full Qwen/ViT checkpoint
+inference or Windows/macOS validation.
+
+### Refactor acceptance (2026-10-14)
+
+`minicpm_v47_refactor_validation.json` records the tested source fingerprints and
+results using the existing converted checkpoint, with no reconversion:
+
+- All 7 CTest targets and all 14 vision-export tests passed (native component and
+  full-vision probes enabled; no exporter-test skips).
+- 1,290 Pillow resize comparisons are byte-exact; all 20 complete official PIL
+  preprocessing cases have zero pixel error. All 252 official HF canvas,
+  nearest-position and rotary-cache cases pass (maximum rotary error 1.573e-5).
+- The trained 64x1024 projected image features are bit-for-bit equal to the
+  pre-refactor native output. Maximum absolute error against official HF remains
+  6.938e-5; cosine similarity is 0.999999999906.
+- Trained decoder maximum absolute error against the saved independent HF
+  eight-token target is 4.215e-4 (within the original 5e-4 tolerance).
+- Pencil VQA exactly matches official HF and the pre-refactor answer:
+  “A red pencil with a yellow tip rests in a glass of water, partially submerged.”
+- Bee VQA exactly matches the pre-refactor answer:
+  “A bumblebee rests on a pink cosmos flower, surrounded by wilting blooms and
+  red flowers in a garden.” This second case has no independent HF reference.
+- Both image-question runs completed successfully; peak child RSS was
+  6,442,196 KiB. Optional legacy model integration tests skipped three missing
+  model cases; the new shared-utility legacy-path regressions did run.
+
+Enable the native exporter regressions with the same build:
+
+```sh
+NCNN_COMPONENT_PROBE="$BUILD/minicpm_component_probe" \
+NCNN_VISION_PROBE="$BUILD/minicpm_trained_vision_probe" \
+python -m unittest discover -s tests -p test_minicpm_v47_vision_export.py -v
+```

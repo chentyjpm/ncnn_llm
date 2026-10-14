@@ -1,5 +1,6 @@
 // A standard-C++ bridge for test_minicpm_vision_reference.py. No model weights.
-#include "utils/minicpm_vision.h"
+#include "utils/image_utils.h"
+#include "utils/rope_embed.h"
 #include <iomanip>
 #include <iostream>
 using namespace ncnn_llm::minicpm;

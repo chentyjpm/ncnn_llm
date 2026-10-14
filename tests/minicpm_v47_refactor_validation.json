@@ -1,0 +1,93 @@
+{
+  "date_utc": "2026-10-14",
+  "source_base_commit": "09fb5f3312e63b9abdd8b803c0548303a0484042",
+  "model": "openbmb/MiniCPM-V-4.7-1B",
+  "model_revision": "ef3ab3bf0120a60e1a2d2b52d984a79d8cb7c630",
+  "ncnn_revision": "b0f97f43f266617ff5e5096d440dbe3f9a4c35b8",
+  "platform": "Linux x86_64 CPU FP32",
+  "existing_converted_package_reused": true,
+  "vision_threads": 2,
+  "vqa_threads": 4,
+  "vqa_max_new_tokens": 32,
+  "prompt": "Describe this image in one short sentence.",
+  "tests": {
+    "ctest_passed": 7,
+    "legacy_optional_model_cases_skipped": 3,
+    "legacy_skip_reason": "Optional original text/int8 model packages absent; shared image/vision utilities were tested directly",
+    "vision_export_unit_tests_passed": 14,
+    "vision_export_skipped": 0,
+    "pillow_byte_exact_resize_cases": 1290,
+    "official_pil_full_preprocess_cases": 20,
+    "official_pil_preprocess_max_abs": 0.0,
+    "hf_canvas_nearest_rope_cases": 252,
+    "hf_rope_max_abs": 1.57281756e-05
+  },
+  "runtime_source_sha256": {
+    "CMakeLists.txt": "0c482c4d34344db6e1ea6078d1f141ae231ea78f7b92eab3d71e235dc190e3e1",
+    "src/ncnn_llm_gpt.cpp": "9cf786aee64366e03898616b5a5b938985039e3839db70b2bf2295025d84b892",
+    "src/ncnn_llm_gpt.h": "ebfd07cfb28f493bf63a2eb9c30a228bce6958561dd244efceed8f089b0c493a",
+    "src/utils/image_utils.cpp": "bc6fcb98fef1bab7c2f99051e9fcf1deb935cdbc580ec723959dffb1b51cd6cb",
+    "src/utils/image_utils.h": "6e04200c6f421e2b631f5b550ce4dd0153eee76ced3d1db99c098435e34a9123",
+    "src/utils/rope_embed.cpp": "9453e83328bfeb56a0964525281e650f77de566cc6499809e9c0d6896f379c8e",
+    "src/utils/rope_embed.h": "639b37819ce04b527934ef726cd8dc34a9bfef586100505446de18fee05f0818"
+  },
+  "trained_vision": {
+    "returncode": 0,
+    "seconds": 51.28915585699724,
+    "shape": [
+      64,
+      1024
+    ],
+    "hf_max_abs": 6.937980651855469e-05,
+    "hf_mean_abs": 1.4625606682555636e-06,
+    "hf_cosine": 0.9999999999062039,
+    "pre_refactor_max_abs": 0.0,
+    "bitwise_equal_to_pre_refactor": true
+  },
+  "trained_decoder": {
+    "returncode": 0,
+    "seconds": 5.725434425010462,
+    "trained_decoder": true,
+    "full_vqa": false,
+    "shape": [
+      1024,
+      8
+    ],
+    "max_abs": 0.0004215240478515625,
+    "mean_abs": 1.2515714690408686e-05,
+    "cosine": 0.9999999999891479,
+    "relative_l2": 4.6627328734838095e-06,
+    "atol": 0.0005,
+    "rtol": 0.0005,
+    "passed": true
+  },
+  "trained_decoder_parity": {
+    "returncode": 0,
+    "seconds": 0.21527768499800004
+  },
+  "refract-448": {
+    "returncode": 0,
+    "seconds": 37.911172776002786,
+    "image": "refract-448.png",
+    "text": "A red pencil with a yellow tip rests in a glass of water, partially submerged.",
+    "pre_refactor_text": "A red pencil with a yellow tip rests in a glass of water, partially submerged.",
+    "exact_match": true,
+    "hf_reference_available": true
+  },
+  "bee-448": {
+    "returncode": 0,
+    "seconds": 36.86429378899629,
+    "image": "bee-448.png",
+    "text": "A bumblebee rests on a pink cosmos flower, surrounded by wilting blooms and red flowers in a garden.",
+    "pre_refactor_text": "A bumblebee rests on a pink cosmos flower, surrounded by wilting blooms and red flowers in a garden.",
+    "exact_match": true,
+    "hf_reference_available": false
+  },
+  "max_child_rss_kib": 6442196,
+  "limitations": [
+    "Single-image 448x448 thumbnails,16x,CPU FP32 only",
+    "No full legacy Qwen/ViT checkpoint regression: weights unavailable",
+    "Bee checked against pre-refactor answer; no independent HF bee reference",
+    "No Windows/macOS/GPU/quantized/detail-slice/video/multi-image validation"
+  ]
+}
