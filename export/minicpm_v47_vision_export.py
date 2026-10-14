@@ -192,25 +192,6 @@ def build_graphs(config):
     return graphs
 
 
-def window_indices(height, width):
-    """Flatten row-major 2x2 windows, in row-major window order."""
-    if height <= 0 or width <= 0 or height % 2 or width % 2:
-        raise ValueError("Patch grid must be positive and divisible by 2")
-    return np.arange(height * width).reshape(height // 2, 2, width // 2, 2).transpose(0, 2, 1, 3).reshape(-1)
-
-
-def nearest_position_ids(height, width, position_grid_size=70):
-    """SigLIP nearest-grid buckets (not bilinear interpolation)."""
-    if min(height, width, position_grid_size) <= 0:
-        raise ValueError("Grid dimensions must be positive")
-    boundaries = np.arange(1, position_grid_size, dtype=np.float32) / position_grid_size
-    ys = np.arange(height, dtype=np.float32) / height
-    xs = np.arange(width, dtype=np.float32) / width
-    rows = np.searchsorted(boundaries, ys, side="right")
-    cols = np.searchsorted(boundaries, xs, side="right")
-    return (rows[:, None] * position_grid_size + cols[None, :]).reshape(-1)
-
-
 def export_minicpm_v47_vision(model_dir, output_dir, prefix="", source=None):
     config = json.loads((Path(model_dir) / "config.json").read_text())
     if config.get("model_type") != "minicpmv4_7":

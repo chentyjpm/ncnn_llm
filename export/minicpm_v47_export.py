@@ -100,6 +100,64 @@ def export_vision_settings(model_dir, output_dir, prefix="", do_bf16=False):
     }
 
 
+
+def validate_runtime_config(cfg):
+    """Reject unsupported packages before allocating weights or creating staging.
+
+    These are the native MiniCPM CPU manifest/positioning constraints, not the
+    more general tiny-graph contracts accepted by the lower-level exporters.
+    """
+    import math
+
+    def require(condition, message):
+        if not condition:
+            raise ValueError("unsupported MiniCPM runtime config: " + message)
+
+    def integer(value, low, high, name):
+        require(type(value) is int and low <= value <= high, name)
+        return value
+
+    require(isinstance(cfg, dict), 'config must be an object')
+    require(cfg.get('model_type') == 'minicpmv4_7', 'model_type')
+    text, vision = cfg.get('text_config', {}), cfg.get('vision_config', {})
+    require(isinstance(text, dict) and isinstance(vision, dict), 'text_config and vision_config must be objects')
+    require(text.get('model_type') == 'qwen3_5_text', 'text model_type')
+    require(not cfg.get('tie_word_embeddings', False) and not text.get('tie_word_embeddings', False), 'untied embeddings required')
+    width = integer(vision.get('hidden_size'), 1, 2048, 'vision hidden_size')
+    integer(text.get('hidden_size'), 1, 8192, 'text hidden_size')
+    require(vision.get('patch_size', 14) == 14 and vision.get('num_channels', 3) == 3, 'RGB patch_size=14 required')
+    image = integer(vision.get('image_size', 980), 14, 14 * 128, 'vision image_size')
+    require(image % 14 == 0, 'vision image_size must be divisible by patch_size')
+    layers = integer(vision.get('num_hidden_layers'), 2, 64, 'vision num_hidden_layers')
+    integer(cfg.get('insert_layer_id', vision.get('insert_layer_id', 6)), 0, layers - 2, 'insert_layer_id')
+    heads = integer(vision.get('num_attention_heads'), 1, width, 'vision num_attention_heads')
+    require(width % heads == 0, 'vision hidden_size must be divisible by heads')
+    require(vision.get('window_kernel_size', [2, 2]) == [2, 2] and cfg.get('merge_kernel_size', [2, 2]) == [2, 2], '2x2 window/projector kernels required')
+    require(cfg.get('merger_times', 1) == 1, 'merger_times=1 required')
+    require(cfg.get('downsample_mode', '16x') == '16x' and cfg.get('mrope_mode', 'canvas') == 'canvas', '16x canvas mode required')
+    kinds = text.get('layer_types', [])
+    require(isinstance(kinds, list) and len(kinds) == text.get('num_hidden_layers') and
+            all(kind in ('full_attention', 'linear_attention') for kind in kinds), 'text layer_types')
+    require(1 <= kinds.count('full_attention') <= 64 and 1 <= kinds.count('linear_attention') <= 192, 'hybrid attention layer counts')
+    rope = text.get('rope_parameters', {})
+    require(isinstance(rope, dict), 'rope_parameters must be an object')
+    head = integer(text.get('head_dim'), 1, 8192, 'head_dim')
+    factor = rope.get('partial_rotary_factor', text.get('partial_rotary_factor', 1.0))
+    require(isinstance(factor, (int, float)) and math.isfinite(factor) and 0 < factor <= 1, 'partial_rotary_factor')
+    dimension = int(head * factor)
+    require(dimension > 0 and dimension % 2 == 0, 'positive even rotary dimension')
+    sections = rope.get('mrope_section', [])
+    require(isinstance(sections, list) and len(sections) == 3 and
+            all(type(n) is int and n >= 0 for n in sections) and sum(sections) == dimension // 2, 'mrope_section')
+    require(rope.get('rope_type', 'default') == 'default' and rope.get('mrope_interleaved', True) is True, 'default interleaved MRoPE required')
+    theta = rope.get('rope_theta', 10000000.0)
+    require(isinstance(theta, (int, float)) and math.isfinite(theta) and theta > 0, 'rope_theta')
+    vocab = integer(text.get('vocab_size'), 1, 2147483647, 'vocab_size')
+    markers = [integer(cfg.get(key), 0, vocab - 1, key) for key in
+               ('image_token_id', 'image_start_id', 'image_end_id', 'slice_start_id', 'slice_end_id', 'newline_id')]
+    require(len(set(markers)) == 6, 'distinct marker IDs required')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", "-m", required=True)
@@ -110,8 +168,7 @@ def main():
         raise ValueError("Output directory already exists; choose a new destination to preserve existing files")
     with open(os.path.join(args.model_dir, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
-    if cfg.get("model_type") != "minicpmv4_7":
-        raise ValueError("checkpoint is not MiniCPM-V 4.7")
+    validate_runtime_config(cfg)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.staging-", dir=destination.parent))
     print(f"[staging] {staging}; retained for diagnosis if conversion fails", flush=True)
